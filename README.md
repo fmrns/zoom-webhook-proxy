@@ -21,7 +21,7 @@ Copy the **Secret Token** from the app settings.
 ### 2. Install dependencies
 
 ```sh
-npm install express axios dotenv
+npm install express axios dotenv ip-cidr ipaddr.js
 ```
 
 ### 3. Configure `.env`

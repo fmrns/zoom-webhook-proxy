@@ -30,13 +30,32 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const bodyParser = require('body-parser');
+const ipaddr = require('ipaddr.js');
+const cidr = require('ip-cidr').default;
 
-const app = express();
+const SIGNATURE_KEY = 'x-zm-signature';
+const TIMESTAMP_KEY = 'x-zm-request-timestamp';
+
 const PORT = process.env.PORT || 3000;
 const ZOOM_SECRET = process.env.ZOOM_SECRET;
 const POST_URL = process.env.POST_URL; // "https://script.google.com/macros/s/.../exec
-const SIGNATURE_KEY = 'x-zm-signature';
-const TIMESTAMP_KEY = 'x-zm-request-timestamp';
+const cidrList = process.env.REMOTE_CIDR_LIST
+  .split(',')
+  .map(c => new cidr(c.trim()));
+
+
+/**
+ * @param {string} ip
+ * @param {cidr[]} cidrList
+ * @returns {boolean}
+ */
+function is_ip_in(ip, cidrList) {
+  try {
+    return cidrList.some(c => c.contains(ip));
+  } catch (e) {
+    return false;
+  }
+}
 
 /**
  * @param {string} signature
@@ -52,6 +71,8 @@ function is_valid_signature(signature, timestamp, body) {
   return `v0=${hash}` === signature;
 }
 
+const app = express();
+app.set('trust proxy', true); // Nginx
 //app.use(bodyParser.json());
 app.use(bodyParser.json({
   verify: (req, res, buf) => {
@@ -60,16 +81,42 @@ app.use(bodyParser.json({
 }));
 
 app.post('/zoom-webhook-proxy', async (req, res) => {
+  const nw = new Date().getTime() / 1000;
+
+  let remoteAddr = req.ip || req.connection.remoteAddress;
+  try {
+    const norm = ipaddr.parse(remoteAddr);
+    remoteAddr = (norm.kind() === 'ipv6' && norm.isIPv4MappedAddress())
+      ? norm.toIPv4Address().toString()
+      : norm.toString();
+  } catch (err) {
+    console.error('failed: ', err.message);
+  }
+  console.info(`remote: ${remoteAddr}`);
+  if (!is_ip_in(remoteAddr, cidrList)) {
+    console.warn(`invalid remote: ${remoteAddr}`);
+    return res.status(403).send('IP not allowed');
+  }
+
+  const signatureValue = req.headers?.[SIGNATURE_KEY] || null;
+  const timestampValue = req.headers?.[TIMESTAMP_KEY] || null;
+  const timestampInt = timestampValue ? parseInt(timestampValue, 10) : -1;
+
+  if (timestampInt < nw - 5 || timestampInt > nw) {
+    console.warn(`invalid timestamp: ${timestampInt} now: ${nw}`);
+    return res.status(403).send('invalid timestamp');
+  }
+
   if (req.body.event === 'endpoint.url_validation') {
     const plainToken = req.body.payload.plainToken;
     const hashedToken = crypto
       .createHmac('sha256', ZOOM_SECRET)
       .update(plainToken).digest('hex');
-    const response_body = {
+    const responseBody = {
       plainToken,
       encryptedToken: hashedToken
     };
-    return res.status(200).json(response_body);
+    return res.status(200).json(responseBody);
 
     // *********************************************************
     // validation requires an immediate response. the proxy must
@@ -84,9 +131,6 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
     //console.log('hashed token(GAS): ', hashedTokenGAS);
     //return res.status(200).json(responseGAS.data);
   }
-
-  const signatureValue = req.headers[SIGNATURE_KEY];
-  const timestampValue = req.headers[TIMESTAMP_KEY];
 
   // avoid re-serializing... cf. JCS
   // xxx `v0:${timestampValue}:${JSON.stringify(req.body)}`;
@@ -106,6 +150,7 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
       'Content-Type': 'application/json'
     });
     console.log('forwarded: ', responseGAS.status);
+    console.log(responseGAS.data);
   } catch (err) {
     console.error('failed: ', err.message);
   }

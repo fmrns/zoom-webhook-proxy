@@ -25,6 +25,7 @@
 //  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
+const TIMESTAMP_TOLERANCE_SECONDS = 10;
 const ZOOM_SECRET = '...';
 const SIGNATURE_KEY = 'http_x_zm_signature';
 const TIMESTAMP_KEY = 'http_x_zm_request_timestamp';
@@ -56,21 +57,31 @@ function getSheet(name) {
 function is_valid_signature(signature, timestamp, body) {
   const hashedBody = Utilities
     .computeHmacSha256Signature(`v0:${timestamp}:${body}`, ZOOM_SECRET, Utilities.Charset.UTF_8)
-    .map(b => ('0' + (b & 0xFF).toString(16)).slice(-2))
+    .map(b => (b & 0xFF).toString(16).padStart(2, '0'))
     .join('');
   return signature === ('v0=' + hashedBody);
 }
 
 function doPost(e) {
+  const nw = new Date().getTime() / 1000;
   const trimmedFields = {
     [SIGNATURE_KEY]: e.parameter[SIGNATURE_KEY],
     [TIMESTAMP_KEY]: e.parameter[TIMESTAMP_KEY]
   }
-  return handlePost(e.postData.contents, trimmedFields)
+  return handlePost(e.postData.contents, trimmedFields, nw)
 }
 
-function handlePost(contents, http_header = null) {
+function handlePost(contents, http_header = null, nw = null) {
   const zoomWebhook = JSON.parse(contents);
+  const signatureValue = http_header?.[SIGNATURE_KEY] || null;
+  const timestampValue = http_header?.[TIMESTAMP_KEY] || null;
+  const timestampInt = timestampValue ? parseInt(timestampValue, 10) : -1;
+
+  if (nw && (timestampInt < nw - TIMESTAMP_TOLERANCE_SECONDS || timestampInt > nw)) {
+    return ContentService
+      .createTextOutput('invalid timestamp')
+      .setMimeType(ContentService.MimeType.TEXT);
+  }
 
   if (zoomWebhook.event === 'endpoint.url_validation') {
     // **********************************************
@@ -81,7 +92,7 @@ function handlePost(contents, http_header = null) {
     const plainToken = zoomWebhook.payload.plainToken;
     const hashedToken = Utilities
       .computeHmacSha256Signature(plainToken, ZOOM_SECRET, Utilities.Charset.UTF_8)
-      .map(b => ('0' + (b & 0xFF).toString(16)).slice(-2))
+      .map(b => (b & 0xFF).toString(16).padStart(2, '0'))
       .join('');
     const response_body = {
       plainToken: plainToken,
@@ -101,9 +112,12 @@ function handlePost(contents, http_header = null) {
     zoomWebhook.payload.object.id, zoomWebhook.event,
     JSON.stringify(zoomWebhook) ]);
 
-  if (http_header && !is_valid_signature(http_header[SIGNATURE_KEY], http_header[TIMESTAMP_KEY], contents)){
-    log.appendRow([ new Date(), 'invalid signature' ]);
-    return ContentService.createTextOutput('invalid signature').setMimeType(ContentService.MimeType.TEXT);
+  if (http_header && !is_valid_signature(signatureValue, timestampValue, contents)){
+    log.appendRow([ new Date(), 'invalid signature',
+      http_header[SIGNATURE_KEY], http_header[TIMESTAMP_KEY] ]);
+    return ContentService
+      .createTextOutput('invalid signature')
+      .setMimeType(ContentService.MimeType.TEXT);
   }
 
   // *******************
@@ -116,7 +130,8 @@ function handlePost(contents, http_header = null) {
   const userName = participant.user_name;
   const uuid = participant.participant_uuid;
 
-  const dateStr = Utilities.formatDate(participation_timestamp, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const dateStr = Utilities
+    .formatDate(participation_timestamp, Session.getScriptTimeZone(), 'yyyy-MM-dd');
   const sheetName = `${meetingId} - ${dateStr}`;
 
   const sheet = getSheet(sheetName);

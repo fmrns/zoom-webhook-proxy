@@ -26,11 +26,11 @@ npm install express axios dotenv ip-cidr ipaddr.js
 
 ### 3. Configure `.env`
 
-Create a `.env` file with the following:
+Copy the `example.env` file to a `.env` file and fill the following:
 
 ```env
-POST_URL=https://script.google.com/macros/s/.../exec
-ZOOM_SECRET=your_zoom_webhook_secret
+POST_URL="https://script.google.com/macros/s/.../exec"
+ZOOM_SECRET="your_zoom_webhook_secret"
 ```
 
 - `POST_URL`: The URL of your Google Apps Script `doPost()` endpoint

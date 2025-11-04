@@ -35,6 +35,22 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ZOOM_SECRET = process.env.ZOOM_SECRET;
 const POST_URL = process.env.POST_URL; // "https://script.google.com/macros/s/.../exec
+const SIGNATURE_KEY = 'x-zm-signature';
+const TIMESTAMP_KEY = 'x-zm-request-timestamp';
+
+/**
+ * @param {string} signature
+ * @param {string} timestamp
+ * @param {string} body
+ * @returns {boolean}
+ */
+function is_valid_signature(signature, timestamp, body) {
+  const hash = crypto
+    .createHmac('sha256', ZOOM_SECRET)
+    .update(`v0:${timestamp}:${body}`)
+    .digest('hex');
+  return `v0=${hash}` === signature;
+}
 
 //app.use(bodyParser.json());
 app.use(bodyParser.json({
@@ -44,9 +60,6 @@ app.use(bodyParser.json({
 }));
 
 app.post('/zoom-webhook-proxy', async (req, res) => {
-  const signatureField = req.headers['x-zm-signature'];
-  const timestampField = req.headers['x-zm-request-timestamp'];
-
   if (req.body.event === 'endpoint.url_validation') {
     const plainToken = req.body.payload.plainToken;
     const hashedToken = crypto
@@ -72,24 +85,30 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
     //return res.status(200).json(responseGAS.data);
   }
 
-  // avoid re-serializing... cf. JCS
-  //const message = `v0:${timestampField}:${JSON.stringify(req.body)}`;
-  const message = `v0:${timestampField}:${req.fmsRawBody}`;
-  const hash = crypto
-    .createHmac('sha256', ZOOM_SECRET)
-    .update(message)
-    .digest('hex');
-  const expectedSignature = `v0=${hash}`;
+  const signatureValue = req.headers[SIGNATURE_KEY];
+  const timestampValue = req.headers[TIMESTAMP_KEY];
 
-  if (signatureField !== expectedSignature) {
+  // avoid re-serializing... cf. JCS
+  // xxx `v0:${timestampValue}:${JSON.stringify(req.body)}`;
+  if (!is_valid_signature(signatureValue, timestampValue, req.fmsRawBody)) {
     console.warn('invalid signature.');
-    return res.status(403).send('Invalid signature');
+    return res.status(403).send('invalid signature');
   }
   res.status(200).send('OK');
 
-  // proxy
-  console.log('Zoom Event:', req.body.event);
-  const responseGAS = await axios.post(POST_URL, req.body);
+  try {
+    console.log('forwarding event: ', req.body.event);
+    const query = new URLSearchParams({
+      http_x_zm_signature: signatureValue,
+      http_x_zm_request_timestamp: timestampValue
+    });
+    const responseGAS = await axios.post(`${POST_URL}?${query.toString()}`, req.fmsRawBody, {
+      'Content-Type': 'application/json'
+    });
+    console.log('forwarded: ', responseGAS.status);
+  } catch (err) {
+    console.error('failed: ', err.message);
+  }
 });
 
 app.listen(PORT, () => {

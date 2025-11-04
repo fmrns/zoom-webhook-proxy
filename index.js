@@ -39,6 +39,7 @@ const TIMESTAMP_KEY = 'x-zm-request-timestamp';
 const PORT = process.env.PORT || 3000;
 const ZOOM_SECRET = process.env.ZOOM_SECRET;
 const POST_URL = process.env.POST_URL; // "https://script.google.com/macros/s/.../exec
+const TIMESTAMP_TOLERANCE_SEC = parseInt(process.env.TIMESTAMP_TOLERANCE_SEC, 10);
 const cidrList = process.env.REMOTE_CIDR_LIST
   .split(',')
   .map(c => new cidr(c.trim()));
@@ -51,8 +52,13 @@ const cidrList = process.env.REMOTE_CIDR_LIST
  */
 function is_ip_in(ip, cidrList) {
   try {
-    return cidrList.some(c => c.contains(ip));
-  } catch (e) {
+    const norm = ipaddr.parse(ip);
+    const remoteAddr = (norm.kind() === 'ipv6' && norm.isIPv4MappedAddress())
+      ? norm.toIPv4Address().toString()
+      : norm.toString();
+    return cidrList.some(c => c.contains(remoteAddr));
+  } catch (err) {
+    console.error('failed: ', err.message);
     return false;
   }
 }
@@ -84,14 +90,6 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
   const nw = new Date().getTime() / 1000;
 
   let remoteAddr = req.ip || req.connection.remoteAddress;
-  try {
-    const norm = ipaddr.parse(remoteAddr);
-    remoteAddr = (norm.kind() === 'ipv6' && norm.isIPv4MappedAddress())
-      ? norm.toIPv4Address().toString()
-      : norm.toString();
-  } catch (err) {
-    console.error('failed: ', err.message);
-  }
   console.info(`remote: ${remoteAddr}`);
   if (!is_ip_in(remoteAddr, cidrList)) {
     console.warn(`invalid remote: ${remoteAddr}`);
@@ -102,7 +100,7 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
   const timestampValue = req.headers?.[TIMESTAMP_KEY] || null;
   const timestampInt = timestampValue ? parseInt(timestampValue, 10) : -1;
 
-  if (timestampInt < nw - 5 || timestampInt > nw) {
+  if (timestampInt < nw - TIMESTAMP_TOLERANCE_SEC || timestampInt > nw) {
     console.warn(`invalid timestamp: ${timestampInt} now: ${nw}`);
     return res.status(403).send('invalid timestamp');
   }

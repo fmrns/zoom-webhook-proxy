@@ -25,7 +25,7 @@
 //  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-require('dotenv').config();
+require('dotenv').config({ path: __dirname + '/.env' });
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -40,7 +40,7 @@ const PORT = process.env.PORT || 3000;
 const ZOOM_SECRET = process.env.ZOOM_SECRET;
 const POST_URL = process.env.POST_URL; // "https://script.google.com/macros/s/.../exec
 const TIMESTAMP_TOLERANCE_SEC = parseInt(process.env.TIMESTAMP_TOLERANCE_SEC, 10);
-const cidrList = process.env.REMOTE_CIDR_LIST
+const ALLOWED_WEBHOOK_CIDR_LIST = process.env.ALLOWED_WEBHOOK_CIDR_LIST
   .split(',')
   .map(c => new cidr(c.trim()));
 
@@ -50,7 +50,7 @@ const cidrList = process.env.REMOTE_CIDR_LIST
  * @param {cidr[]} cidrList
  * @returns {boolean}
  */
-function is_ip_in(ip, cidrList) {
+function isIPIn(ip, cidrList) {
   try {
     const norm = ipaddr.parse(ip);
     const remoteAddr = (norm.kind() === 'ipv6' && norm.isIPv4MappedAddress())
@@ -69,7 +69,7 @@ function is_ip_in(ip, cidrList) {
  * @param {string} body
  * @returns {boolean}
  */
-function is_valid_signature(signature, timestamp, body) {
+function isValidSignature(signature, timestamp, body) {
   const hash = crypto
     .createHmac('sha256', ZOOM_SECRET)
     .update(`v0:${timestamp}:${body}`)
@@ -81,19 +81,21 @@ const app = express();
 app.set('trust proxy', true); // Nginx
 //app.use(bodyParser.json());
 app.use(bodyParser.json({
+  // avoid re-serializing... cf. JCS
+  // xxx `v0:${timestampValue}:${JSON.stringify(req.body)}`;
   verify: (req, res, buf) => {
     req.fmsRawBody = buf.toString('utf8');
   }
 }));
 
+let isForwardAllowed = true;
 app.post('/zoom-webhook-proxy', async (req, res) => {
   const nw = new Date().getTime() / 1000;
 
   let remoteAddr = req.ip || req.connection.remoteAddress;
-  console.info(`remote: ${remoteAddr}`);
-  if (!is_ip_in(remoteAddr, cidrList)) {
+  if (!isIPIn(remoteAddr, ALLOWED_WEBHOOK_CIDR_LIST)) {
     console.warn(`invalid remote: ${remoteAddr}`);
-    return res.status(403).send('IP not allowed');
+    return res.status(403).send('request denied: IP address not allowed.');
   }
 
   const signatureValue = req.headers?.[SIGNATURE_KEY] || null;
@@ -101,45 +103,43 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
   const timestampInt = timestampValue ? parseInt(timestampValue, 10) : -1;
 
   if (timestampInt < nw - TIMESTAMP_TOLERANCE_SEC || timestampInt > nw) {
-    console.warn(`invalid timestamp: ${timestampInt} now: ${nw}`);
+    console.warn(`remote: ${remoteAddr}: invalid timestamp: ${timestampInt} now: ${nw}`);
     return res.status(403).send('invalid timestamp');
   }
 
-  if (req.body.event === 'endpoint.url_validation') {
+  let hashedToken;
+  const isEndpointValidation = (req.body.event === 'endpoint.url_validation');
+  if (isEndpointValidation) {
     const plainToken = req.body.payload.plainToken;
-    const hashedToken = crypto
+    hashedToken = crypto
       .createHmac('sha256', ZOOM_SECRET)
       .update(plainToken).digest('hex');
     const responseBody = {
       plainToken,
       encryptedToken: hashedToken
     };
-    return res.status(200).json(responseBody);
+    res.status(200).json(responseBody);
 
-    // *********************************************************
-    // validation requires an immediate response. the proxy must
-    // respond directly instead of forwarding to the destination.
-    // *********************************************************
-    //const responseGAS = await axios.post(POST_URL, {
-    //    event: 'endpoint.url_validation',
-    //    payload: { plainToken }
-    //});
-    //const hashedTokenGAS = responseGAS.data.encryptedToken;
-    //console.log('response(GAS): ', responseGAS.data);
-    //console.log('hashed token(GAS): ', hashedTokenGAS);
-    //return res.status(200).json(responseGAS.data);
-  }
-
-  // avoid re-serializing... cf. JCS
-  // xxx `v0:${timestampValue}:${JSON.stringify(req.body)}`;
-  if (!is_valid_signature(signatureValue, timestampValue, req.fmsRawBody)) {
-    console.warn('invalid signature.');
+    // ***************************************************************
+    // validation requires an immediate response. in other words, the
+    // proxy must not forward the request to the destination and then
+    // return the response to Zoom. instead, it must generate and
+    // return the response directly, as shown above. the following
+    // code verifies that the correct response has been generated and
+    // returned.
+    // ***************************************************************
+  } else if (!isValidSignature(signatureValue, timestampValue, req.fmsRawBody)) {
+    console.warn(`remote: ${remoteAddr}: invalid signature.`);
     return res.status(403).send('invalid signature');
   }
-  res.status(200).send('OK');
 
   try {
-    console.log('forwarding event: ', req.body.event);
+    if (!isForwardAllowed && !isEndpointValidation) {
+      console.warn(`remote: ${remoteAddr}: something wrong with the destination: ${POST_URL}`);
+      return res.status(403).send('request blocked due to suspicious proxy destination');
+    }
+
+    console.log('remote: ${remoteAddr}: forwarding event: ', req.body.event);
     const query = new URLSearchParams({
       http_x_zm_signature: signatureValue,
       http_x_zm_request_timestamp: timestampValue
@@ -147,10 +147,27 @@ app.post('/zoom-webhook-proxy', async (req, res) => {
     const responseGAS = await axios.post(`${POST_URL}?${query.toString()}`, req.fmsRawBody, {
       'Content-Type': 'application/json'
     });
-    console.log('forwarded: ', responseGAS.status);
-    console.log(responseGAS.data);
+    console.log(`remote: ${remoteAddr}: forwarded: ${req.body?.event} [${req.body?.payload?.object?.participant?.user_name}] status: ${responseGAS.status} response: ${responseGAS.data}`);
+
+    if (!isEndpointValidation) {
+      const contentType = responseGAS.headers['content-type'] || 'application/json';
+      return (responseGAS.status >= 200 && responseGAS.status < 300)
+        ? res.status(200).type(contentType).send(responseGAS.data)
+        : res.status(502).type(contentType).send(responseGAS.data);
+    }
+
+    const hashedTokenGAS = responseGAS.data.encryptedToken;
+    isForwardAllowed = (hashedToken === hashedTokenGAS);
+    if (isForwardAllowed) {
+      console.log(`remote: ${remoteAddr}: hashed token matched: ${hashedTokenGAS}`);
+    } else {
+      console.error(`remote: ${remoteAddr}: hashed token mismatch: ${hashedToken}(proxy), ${hashedTokenGAS}(GAS)`);
+    }
   } catch (err) {
-    console.error('failed: ', err.message);
+    console.error(`remote: ${remoteAddr}: ${req.body.event} failed: ${err.message}`);
+    if (req.body.event !== 'endpoint.url_validation') {
+      return res.status(502).send('proxy forwarding failed');
+    }
   }
 });
 

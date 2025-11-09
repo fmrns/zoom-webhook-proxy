@@ -25,7 +25,7 @@
 //  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-const TIMESTAMP_TOLERANCE_SECONDS = 10;
+const TIMESTAMP_TOLERANCE_SECONDS = 30;
 const ZOOM_SECRET = '...';
 const SIGNATURE_KEY = 'http_x_zm_signature';
 const TIMESTAMP_KEY = 'http_x_zm_request_timestamp';
@@ -79,16 +79,18 @@ function handlePost(contents, http_header = null, nw = null) {
 
   if (nw && (timestampInt < nw - TIMESTAMP_TOLERANCE_SECONDS || timestampInt > nw)) {
     return ContentService
-      .createTextOutput('invalid timestamp')
+      .createTextOutput(`invalid timestamp: ${timestampInt}, now:${nw}`)
       .setMimeType(ContentService.MimeType.TEXT);
   }
 
   if (zoomWebhook.event === 'endpoint.url_validation') {
-    // **********************************************
-    // too slow to make it through Zoom's validation.
-    // this should be processed by the front-proxy,
-    // instead of the following.
-    // **********************************************
+    // ******************************************************
+    // this logic produces a valid response, but Zoom does
+    // NOT accept it due to redirection and latency issues.
+    // It is intended exclusively for closed communication
+    // between the proxy and GAS, such as internal checks
+    // initiated by the proxy itself.
+    // ******************************************************
     const plainToken = zoomWebhook.payload.plainToken;
     const hashedToken = Utilities
       .computeHmacSha256Signature(plainToken, ZOOM_SECRET, Utilities.Charset.UTF_8)

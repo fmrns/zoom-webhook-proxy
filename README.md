@@ -5,11 +5,11 @@ A lightweight Node.js proxy that instantly responds to Zoom's 3-second webhook v
 ## Architecture
 
 ```
-Zoom api <-> nginx <- (*) -> zoom-webhook-proxy(Node.js) <- (**) -> Google Apps Script
+Zoom api <-(*)-> nginx - zoom-webhook-proxy(Node.js) <- (**) -> Google Apps Script
 ```
 
-- `(*)` direct connection from Zoom api to Google Apps Script is too slow to pass Zoom's validation. `endpoint.url_validation` event is processed by zoom-web-proxy.
-- `(**)` forward `x-zm-signature` and `x-zm-request-timestamp` via query string. these HTTP fields are trimmed by the GAS enviromnent, so forwarding explicitly is required.
+- `(*)` due to latency issues, direct connections from Zoom API to Google Apps Script cannot satisfy Zoom's validation requirements. additionally, Zoom does not permit redirects. therefore, the `endpoint.url_validation` event is processed by zoom-webhook-proxy.
+- `(**)` the proxy forwards `x-zm-signature` and `x-zm-request-timestamp` via query string, since these HTTP headers are stripped by the Google Apps Script environment. the proxy also checks whether Google Apps Script returns the same result for `endpoint.url_validation`. if the response matches, forwarding behavior continues; otherwise, it is suspended until the next validation pass.
 
 ## Setup
 
